@@ -91,7 +91,7 @@ async def model_download(global_epoch):
     )
     logging.info(f"Model downloaded for epoch {global_epoch}")
     if global_epoch > 0:
-        delete_previous_epochs(global_epoch)
+      await  delete_previous_epochs(global_epoch)
     # Generate group object
     # search_start = random.choice(
     #     range(len(dataset_indices) - training_examples_per_miner + 1)
