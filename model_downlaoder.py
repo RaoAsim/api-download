@@ -105,25 +105,27 @@ async def safe_delete(path, is_dir=False, retries=3, delay=2):
     """Safely deletes a file or directory with retries to prevent permission errors."""
     for attempt in range(retries):
         try:
+            if not path.exists():
+                logging.warning(f"Skipping deletion, path not found: {path}")
+                return True
+            
             if is_dir:
-                shutil.rmtree(path)  # Ensures all subfiles are deleted
+                shutil.rmtree(path, ignore_errors=True)  # Safer directory deletion
                 logging.info(f"Deleted directory: {path}")
             else:
-                path.unlink()
+                path.unlink(missing_ok=True)  # Safe file deletion
                 logging.info(f"Deleted file: {path}")
             return True
-        except FileNotFoundError:
-            logging.warning(f"File not found: {path}, skipping.")
-            return True
-        except PermissionError as e:
+        except PermissionError:
             logging.warning(f"Permission denied: {path}, retrying... [{attempt + 1}/{retries}]")
-            time.sleep(delay)
+            await asyncio.sleep(delay)
         except OSError as e:
             logging.error(f"Error deleting {path}: {e}")
-            time.sleep(delay)
+            await asyncio.sleep(delay)
     
     logging.error(f"Failed to delete {path} after {retries} attempts")
     return False
+
 
             
 
