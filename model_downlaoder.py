@@ -4,12 +4,11 @@ from pathlib import Path
 from huggingface_hub import list_repo_refs
 from transformers import AutoModelForCausalLM
 from bitarray import bitarray
-import sqlite3
 import json
 import asyncio 
 from datetime import datetime, timedelta
 # SQLite database path
-DB_FILE = "model_cache.db"
+
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -26,49 +25,8 @@ logging.basicConfig(
     ]
 )
 
-# Initialize the database
-def init_db():
-    """Set up the SQLite database and table if it does not exist."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS cache (
-            epoch INTEGER PRIMARY KEY,
-            group_data TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
 
-# Cache functions using SQLite
-def cache_group(epoch, group):
-    """Store group data for a specified epoch in the database."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    # Store group data as JSON string in the database
-    cursor.execute("INSERT OR REPLACE INTO cache (epoch, group_data) VALUES (?, ?)",
-                   (epoch, json.dumps(group)))
-    conn.commit()
-    conn.close()
-    logging.info(f"Group data cached for epoch {epoch}")
 
-def get_cached_group(epoch):
-    """Retrieve cached group data for a specified epoch from the database."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT group_data FROM cache WHERE epoch = ?", (epoch,))
-    result = cursor.fetchone()
-    conn.close()
-    if result:
-        return json.loads(result[0])  # Convert JSON back to list
-    return None
-
-# Initialize the database
-init_db()
-
-# Parameters
-dataset_indices = bitarray(519_000_000)
-training_examples_per_miner = 1500
 local_epoch = None
 
 # Get global epoch from Hugging Face repo
@@ -92,70 +50,81 @@ async def model_download(global_epoch):
     logging.info(f"Model downloaded for epoch {global_epoch}")
     if global_epoch > 0:
       await  delete_previous_epochs(global_epoch)
-    # Generate group object
-    # search_start = random.choice(
-    #     range(len(dataset_indices) - training_examples_per_miner + 1)
-    # )
-    # start = dataset_indices.index(
-    #     bitarray("0" * training_examples_per_miner), search_start
-    # )
-    # group = [
-    #     i
-    #     for i in range(
-    #         start, start + training_examples_per_miner
-    #     )
-    # ]
-
-    # # Cache model and group by global_epoch
-    # cache_group(global_epoch, group)  # Save to SQLite
     logging.info(f"Group cached for epoch {global_epoch}")
 
     return True
 
-# Periodic check for global_epoch update
+
+import shutil
+import os
+import time
+
 async def delete_previous_epochs(epoch: int):
     """Deletes refs and cache blobs associated with epochs lower than the given epoch, including .incomplete blobs."""
     deleted_any = False
+
     for ref in REFS_DIR.iterdir():
         try:
             ref_epoch = int(ref.name)
             if ref_epoch < epoch:
                 deleted_any = True
                 ref_creation_time = datetime.fromtimestamp(ref.stat().st_ctime)
+
+                # Delete related blobs (Retry if file is in use)
                 for blob in CACHE_DIR.iterdir():
                     blob_creation_time = datetime.fromtimestamp(blob.stat().st_ctime)
                     if ref_creation_time <= blob_creation_time <= ref_creation_time + timedelta(minutes=10):
-                      blob.unlink()
-                
-                with open(ref, "r") as file:
-                    ref_value = file.read().strip() 
-                    snapshot_path = SNAPSHOTS_DIR / ref_value
-                    if snapshot_path.exists() and snapshot_path.is_dir():
-                        # Recursively delete the snapshot folder
-                        for child in snapshot_path.iterdir():
-                            child.unlink()  # Delete file inside the snapshot
-                        snapshot_path.rmdir()  # Remove the snapshot folder
-                        logging.info(f"Deleted snapshot folder {snapshot_path} for incomplete blob")
+                        await safe_delete(blob)
 
-                ref.unlink()
-                logging.info(f"Deleted ref for epoch {ref_epoch}")
+                # Read ref value and delete associated snapshot
+                with open(ref, "r") as file:
+                    ref_value = file.read().strip()
+                    snapshot_path = SNAPSHOTS_DIR / ref_value
+                    if snapshot_path.exists():
+                        await safe_delete(snapshot_path, is_dir=True)
+
+                # Finally, delete ref itself
+                await safe_delete(ref)
 
         except ValueError:
-            continue  # Ignore non-integer filenames in the refs directory
+            continue  # Ignore non-integer filenames
+        except Exception as e:
+            logging.error(f"Error processing ref {ref}: {e}")
 
     if not deleted_any:
         logging.info(f"No refs with smaller epochs than {epoch} were found")
 
-    # Delete blobs with .incomplete in their name
+    # Delete blobs with .incomplete in their name (Retry if necessary)
     for blob in CACHE_DIR.iterdir():
         if ".incomplete" in blob.name:
-            try:
-                blob.unlink()
-                logging.info(f"Deleted incomplete blob {blob.name}")
-            except Exception as e:
-                logging.error(f"Error deleting incomplete blob {blob.name}: {e}")
+            await safe_delete(blob)
+
+    logging.info("Deletion Completed")
+
+async def safe_delete(path, is_dir=False, retries=3, delay=2):
+    """Safely deletes a file or directory with retries to prevent permission errors."""
+    for attempt in range(retries):
+        try:
+            if is_dir:
+                shutil.rmtree(path)  # Ensures all subfiles are deleted
+                logging.info(f"Deleted directory: {path}")
+            else:
+                path.unlink()
+                logging.info(f"Deleted file: {path}")
+            return True
+        except FileNotFoundError:
+            logging.warning(f"File not found: {path}, skipping.")
+            return True
+        except PermissionError as e:
+            logging.warning(f"Permission denied: {path}, retrying... [{attempt + 1}/{retries}]")
+            time.sleep(delay)
+        except OSError as e:
+            logging.error(f"Error deleting {path}: {e}")
+            time.sleep(delay)
     
-    logging.info(f"Deletion Completed")
+    logging.error(f"Failed to delete {path} after {retries} attempts")
+    return False
+
             
 
 async def periodic_check():
@@ -193,11 +162,3 @@ async def get_status():
     """Simple endpoint that returns true."""
     return {"status": True}
 
-@app.get("/get_group/{epoch}")
-async def get_group(epoch: int):
-    """Endpoint to retrieve cached group by epoch from SQLite database."""
-    cached_data = get_cached_group(epoch)
-    if cached_data:
-        return {"group": cached_data}
-    else:
-        return {"error": "Data not found for the specified epoch"}
