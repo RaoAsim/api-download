@@ -7,6 +7,10 @@ from bitarray import bitarray
 import json
 import asyncio 
 from datetime import datetime, timedelta
+import gc
+import shutil
+import os
+import time
 # SQLite database path
 
 
@@ -28,6 +32,7 @@ logging.basicConfig(
 
 
 local_epoch = None
+last_delete_call = None
 
 # Get global epoch from Hugging Face repo
 async def get_global_epoch():
@@ -41,23 +46,28 @@ async def get_global_epoch():
 async def model_download(global_epoch):
     """Download the model, generate group, and cache it."""
     # Download the model
+    if last_delete_call is not None and datetime.now() - last_delete_call <= timedelta(minutes=3):
+        await wipe_cache()
+
     model = await asyncio.to_thread(
         AutoModelForCausalLM.from_pretrained,
         "distributed/optimized-gpt2-2b",
         revision=str(global_epoch),  # This must be a valid git revision
         trust_remote_code=True
+        device_map="auto" 
     )
     logging.info(f"Model downloaded for epoch {global_epoch}")
-    if global_epoch > 0:
-      await  delete_previous_epochs(global_epoch)
+    # if global_epoch > 0:
+    #   await  delete_previous_epochs(global_epoch)
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
     logging.info(f"Group cached for epoch {global_epoch}")
 
     return True
 
 
-import shutil
-import os
-import time
+
 
 async def delete_previous_epochs(epoch: int):
     """Deletes refs and cache blobs associated with epochs lower than the given epoch, including .incomplete blobs."""
@@ -101,6 +111,14 @@ async def delete_previous_epochs(epoch: int):
 
     logging.info("Deletion Completed")
 
+async def wipe_cache():
+    """Completely removes the Hugging Face cache directory."""
+    try:
+        os.system("rm -rf ~/.cache/huggingface/hub")
+        logging.info("Hugging Face cache wiped completely.")
+    except Exception as e:
+        logging.error(f"Error wiping cache: {e}")
+        
 async def safe_delete(path, is_dir=False, retries=3, delay=2):
     """Safely deletes a file or directory with retries to prevent permission errors."""
     for attempt in range(retries):
@@ -156,7 +174,9 @@ async def startup_event():
 @app.post("/delete_cache/{epoch}")
 async def delete_cache(epoch: int, background_tasks: BackgroundTasks):
     """API endpoint to trigger deletion of cache and refs for previous epochs, including .incomplete blobs."""
-    background_tasks.add_task(delete_previous_epochs, epoch)
+    global last_delete_call
+    last_delete_call = datetime.now() 
+    # background_tasks.add_task(delete_previous_epochs, epoch)
     return {"status": "Deletion initiated for previous epochs"}
 
 @app.get("/status")
