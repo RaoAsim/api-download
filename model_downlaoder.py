@@ -53,7 +53,7 @@ async def model_download(global_epoch):
         AutoModelForCausalLM.from_pretrained,
         "distributed/optimized-gpt2-2b",
         revision=str(global_epoch),  # This must be a valid git revision
-        trust_remote_code=True
+        trust_remote_code=True,
         device_map="auto" 
     )
     logging.info(f"Model downloaded for epoch {global_epoch}")
