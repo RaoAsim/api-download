@@ -169,14 +169,15 @@ async def periodic_check():
 # Start the periodic check in a background thread
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(periodic_check())
+    logging.info("started")
+    # asyncio.create_task(periodic_check())
 
 @app.post("/delete_cache/{epoch}")
 async def delete_cache(epoch: int, background_tasks: BackgroundTasks):
     """API endpoint to trigger deletion of cache and refs for previous epochs, including .incomplete blobs."""
     global last_delete_call
     last_delete_call = datetime.now() 
-    # background_tasks.add_task(delete_previous_epochs, epoch)
+    background_tasks.add_task(delete_previous_epochs, epoch)
     return {"status": "Deletion initiated for previous epochs"}
 
 @app.get("/status")
